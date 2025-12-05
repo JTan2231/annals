@@ -9,6 +9,7 @@
 *   **LLM Summarization**: transform raw commit logs into a narrative story of accomplishments using OpenAI, Anthropic, or Gemini.
 *   **Smart Chunking**: Automatically splits large commit histories into chunks to fit within LLM context windows.
 *   **JSON & Human Output**: Export raw data for processing or view pretty-printed summaries directly in the terminal.
+*   **Library API**: Consume the same fetch and summarize flows directly from Rust without shelling out.
 
 ## Installation
 
@@ -62,6 +63,37 @@ annals summarize --input commits.json
 # Pretty print the output (wrapped text)
 annals summarize --input commits.json --pretty
 ```
+
+## Embedding as a Library
+
+`annals` exposes the same fetch/summarize pipeline as a crate so other tools can drive it programmatically.
+
+```rust
+use annals::{
+    build_commit_query, fetch_commits, summarize_commits, CommitQueryInput, FetchOpts, SummarizeOpts,
+};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let query = build_commit_query(&CommitQueryInput {
+        user: "jdoe".into(),
+        since: "7 days".into(),
+        until: None,
+        token: std::env::var("GITHUB_TOKEN").ok(),
+        repo: None,
+    })?;
+
+    let commits = fetch_commits(&query, &FetchOpts::default()).await?;
+    let summary = summarize_commits(&commits, SummarizeOpts::default()).await?;
+    println!("{}", summary.summary);
+    Ok(())
+}
+```
+
+Notes:
+
+* `FetchOpts` accepts `base_url` for testing against mock GitHub servers; leave `None` for production.
+* The API is new and may evolve; it mirrors the CLI flags so existing behaviors stay in sync.
 
 ## Development
 
