@@ -1,3 +1,5 @@
+mod summarize;
+
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, TimeZone, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -7,6 +9,9 @@ use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use summarize::{SummarizeOpts, SummaryOutputFormat, pretty_format_summary, summarize_commits};
 
 #[derive(Parser)]
 #[command(
@@ -22,10 +27,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     FetchCommits(FetchCommitsArgs),
+    Summarize(SummarizeArgs),
 }
 
-#[derive(Args, Debug)]
-struct FetchCommitsArgs {
+#[derive(Args, Debug, Clone)]
+struct CommitQueryArgs {
     /// GitHub login to query commits for
     #[arg(long)]
     user: String,
@@ -45,6 +51,12 @@ struct FetchCommitsArgs {
     /// Optional repo filter in owner/name form
     #[arg(long)]
     repo: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct FetchCommitsArgs {
+    #[command(flatten)]
+    query: CommitQueryArgs,
 
     /// Output format for commits
     #[arg(long, value_enum, default_value = "human")]
@@ -53,6 +65,67 @@ struct FetchCommitsArgs {
     /// Emit pagination and request progress
     #[arg(long)]
     verbose: bool,
+}
+
+#[derive(Args, Debug)]
+struct SummarizeArgs {
+    #[command(flatten)]
+    query: CommitQueryArgs,
+
+    #[command(flatten)]
+    summarize: SummarizeCliOpts,
+
+    /// Read commits from a JSON file instead of querying GitHub (same shape as fetch --format json)
+    #[arg(long, value_name = "PATH")]
+    input: Option<PathBuf>,
+
+    /// Emit pagination and request progress
+    #[arg(long)]
+    verbose: bool,
+}
+
+#[derive(Args, Debug)]
+struct SummarizeCliOpts {
+    /// Override the LLM provider (defaults to OpenAI)
+    #[arg(long, value_enum)]
+    provider: Option<ModelProvider>,
+
+    /// Override the LLM model (defaults to OpenAI gpt-4o)
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Maximum characters allowed before compaction
+    #[arg(long, default_value_t = summarize::DEFAULT_MAX_CHARS)]
+    max_chars: usize,
+
+    /// Output format for the summary
+    #[arg(long, value_enum, default_value = "human")]
+    output: SummaryOutputFormat,
+
+    /// Pretty print human-readable output (wrap to 80 columns with blank lines between sentences)
+    #[arg(long)]
+    pretty: bool,
+
+    /// Custom base URL for the LLM API (primarily for testing)
+    #[arg(long, hide = true)]
+    base_url: Option<String>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum ModelProvider {
+    Openai,
+    Anthropic,
+    Gemini,
+}
+
+impl ModelProvider {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ModelProvider::Openai => "openai",
+            ModelProvider::Anthropic => "anthropic",
+            ModelProvider::Gemini => "gemini",
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -113,7 +186,7 @@ struct SearchCommitRepo {
     full_name: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct CommitRecord {
     repo: String,
     sha: String,
@@ -122,6 +195,15 @@ struct CommitRecord {
     url: String,
     author: Option<String>,
     committer: Option<String>,
+}
+
+#[derive(Clone)]
+struct CommitQuery {
+    user: String,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    token: Option<String>,
+    repo_filter: Option<RepoFilter>,
 }
 
 #[derive(Clone)]
@@ -137,14 +219,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::FetchCommits(args) => run_fetch_commits(args).await?,
+        Commands::Summarize(args) => run_summarize(args).await?,
     }
     Ok(())
 }
 
-async fn run_fetch_commits(args: FetchCommitsArgs) -> Result<()> {
+fn build_commit_query(args: &CommitQueryArgs) -> Result<CommitQuery> {
     let since = parse_datetime(&args.since)?;
-    let until = match args.until {
-        Some(ref ts) => parse_datetime(ts)?,
+    let until = match &args.until {
+        Some(ts) => parse_datetime(ts)?,
         None => Utc::now(),
     };
     if since >= until {
@@ -153,41 +236,64 @@ async fn run_fetch_commits(args: FetchCommitsArgs) -> Result<()> {
 
     let token = args
         .token
+        .clone()
         .or_else(|| env::var("GITHUB_TOKEN").ok())
         .filter(|t| !t.is_empty());
-    let repo_filter = if let Some(repo) = args.repo {
+    let repo_filter = if let Some(ref repo) = args.repo {
         Some(RepoFilter::parse(&repo)?)
     } else {
         None
     };
 
-    let client = GitHubClient::new(token, args.verbose)?;
+    Ok(CommitQuery {
+        user: args.user.clone(),
+        since,
+        until,
+        token,
+        repo_filter,
+    })
+}
+
+async fn gather_commits(query: &CommitQuery, verbose: bool) -> Result<Vec<CommitRecord>> {
+    let client = GitHubClient::new(query.token.clone(), verbose)?;
     let repos = client
-        .list_repos(&args.user, repo_filter.as_ref())
+        .list_repos(&query.user, query.repo_filter.as_ref())
         .await
         .context("failed to list repositories")?;
 
     if repos.is_empty() {
-        bail!("No repositories found for user {}", args.user);
+        bail!("No repositories found for user {}", query.user);
     }
 
     eprintln!("Discovered {} repositories to scan", repos.len());
 
     let commits = match client
-        .search_commits(&args.user, since, until, repo_filter.as_ref())
+        .search_commits(
+            &query.user,
+            query.since,
+            query.until,
+            query.repo_filter.as_ref(),
+        )
         .await
     {
         Ok(commits) => commits,
         Err(err) => {
-            if args.verbose {
+            if verbose {
                 eprintln!(
                     "Commit search unavailable ({}). Falling back to per-repo scanning.",
                     err
                 );
             }
-            collect_commits(&client, repos, &args.user, since, until).await?
+            collect_commits(&client, repos, &query.user, query.since, query.until).await?
         }
     };
+
+    Ok(commits)
+}
+
+async fn run_fetch_commits(args: FetchCommitsArgs) -> Result<()> {
+    let query = build_commit_query(&args.query)?;
+    let commits = gather_commits(&query, args.verbose).await?;
 
     if commits.is_empty() {
         println!("No commits found for the specified window.");
@@ -202,8 +308,77 @@ async fn run_fetch_commits(args: FetchCommitsArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_summarize(args: SummarizeArgs) -> Result<()> {
+    let commits = if let Some(ref input) = args.input {
+        load_commits_from_file(input)?
+    } else {
+        let query = build_commit_query(&args.query)?;
+        gather_commits(&query, args.verbose).await?
+    };
+
+    if commits.is_empty() {
+        println!("No commits found for the specified window.");
+        return Ok(());
+    }
+
+    let outcome = summarize_commits(
+        &commits,
+        SummarizeOpts {
+            provider: args.summarize.provider.map(|p| p.as_str().to_string()),
+            model: args.summarize.model.clone(),
+            max_chars: args.summarize.max_chars,
+            verbose: args.verbose,
+            base_url: args.summarize.base_url.clone(),
+        },
+    )
+    .await?;
+
+    if args.verbose {
+        eprintln!(
+            "LLM provider={} model={} context={} chars across {} chunk(s); filtered={} truncated_lines={}",
+            outcome.provider,
+            outcome.model,
+            outcome.context_char_count,
+            outcome.chunk_count,
+            outcome.filtered_out,
+            outcome.truncated_lines
+        );
+        if outcome.truncated {
+            eprintln!(
+                "Commit text compacted to respect {} character budget",
+                args.summarize.max_chars
+            );
+        }
+    }
+
+    match args.summarize.output {
+        SummaryOutputFormat::Human => {
+            let mut summary = outcome.summary;
+            if args.summarize.pretty {
+                summary = pretty_format_summary(&summary);
+            }
+            println!("{summary}");
+        }
+        SummaryOutputFormat::Json => {
+            let output = serde_json::to_string_pretty(&outcome)?;
+            println!("{output}");
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_datetime(input: &str) -> Result<DateTime<Utc>> {
     parse_datetime_with_now(input, Utc::now())
+}
+
+fn load_commits_from_file(path: &Path) -> Result<Vec<CommitRecord>> {
+    let data = fs::read_to_string(path)
+        .with_context(|| format!("failed to read commit input file {}", path.display()))?;
+    let mut commits: Vec<CommitRecord> = serde_json::from_str(&data)
+        .with_context(|| format!("failed to parse commit input file {}", path.display()))?;
+    commits.sort_by_key(|c| c.timestamp);
+    Ok(commits)
 }
 
 fn parse_datetime_with_now(input: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
@@ -339,7 +514,7 @@ async fn collect_commits(
     Ok(aggregated)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RepoFilter {
     owner: String,
     name: String,
@@ -756,6 +931,7 @@ mod tests {
     use super::*;
     use httpmock::Method::GET;
     use httpmock::{Mock, MockServer};
+    use std::fs;
 
     fn client_for(server: &MockServer) -> GitHubClient {
         let base = Url::parse(&format!("{}/", server.base_url())).unwrap();
@@ -1000,5 +1176,28 @@ mod tests {
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].sha, "abc1234");
         assert_eq!(commits[1].repo, "me/demo");
+    }
+
+    #[test]
+    fn loads_commits_from_file() {
+        let path = std::env::temp_dir().join("annals_commits_input.json");
+        let commit = CommitRecord {
+            repo: "demo/repo".into(),
+            sha: "abc1234".into(),
+            message: "sample commit".into(),
+            timestamp: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            url: "http://example/abc1234".into(),
+            author: Some("me".into()),
+            committer: None,
+        };
+        let body = serde_json::to_string(&vec![commit]).unwrap();
+        fs::write(&path, body).unwrap();
+
+        let loaded = load_commits_from_file(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].sha, "abc1234");
+        assert_eq!(loaded[0].repo, "demo/repo");
     }
 }
