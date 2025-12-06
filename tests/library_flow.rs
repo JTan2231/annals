@@ -1,6 +1,6 @@
 use annals::{
-    build_commit_query, fetch_commits, summarize_commits, CommitQueryInput, FetchOpts, SummarizeOpts,
-    DEFAULT_MODEL,
+    CommitQueryInput, DEFAULT_MODEL, EventSink, FetchOpts, SummarizeOpts, build_commit_query,
+    fetch_commits, summarize_commits,
 };
 use httpmock::Method::GET;
 use httpmock::MockServer;
@@ -64,6 +64,7 @@ async fn fetches_and_summarizes_programmatically() {
         &FetchOpts {
             verbose: false,
             base_url: Some(Url::parse(&format!("{}/", github.base_url())).unwrap()),
+            event_sink: EventSink::null(),
         },
     )
     .await
@@ -85,10 +86,9 @@ async fn fetches_and_summarizes_programmatically() {
         }))),
     ];
 
-    let llm_server =
-        MockLLMServer::start(vec![MockRoute::new("/v1/chat/completions", responses)])
-            .await
-            .expect("starts mock llm");
+    let llm_server = MockLLMServer::start(vec![MockRoute::new("/v1/chat/completions", responses)])
+        .await
+        .expect("starts mock llm");
     let llm_base = format!("http://{}", llm_server.address());
 
     let outcome = summarize_commits(
@@ -99,6 +99,7 @@ async fn fetches_and_summarizes_programmatically() {
             max_chars: 1_100,
             verbose: false,
             base_url: Some(llm_base),
+            event_sink: EventSink::null(),
         },
     )
     .await

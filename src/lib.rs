@@ -5,17 +5,79 @@ use futures::stream::{self, StreamExt};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::env;
+use std::fmt;
 use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 pub mod summarize;
 
 pub use summarize::{
-    SummarizeOpts, SummaryOutcome, SummaryOutputFormat, pretty_format_summary,
-    summarize_commits, DEFAULT_MAX_CHARS, DEFAULT_MODEL,
+    DEFAULT_MAX_CHARS, DEFAULT_MODEL, SummarizeOpts, SummaryOutcome, SummaryOutputFormat,
+    pretty_format_summary, summarize_commits,
 };
+
+#[derive(Clone, Default)]
+pub struct EventSink {
+    emitter: Option<Arc<dyn EventEmitter>>,
+}
+
+impl EventSink {
+    pub fn null() -> Self {
+        Self { emitter: None }
+    }
+
+    pub fn json_stderr() -> Self {
+        Self {
+            emitter: Some(Arc::new(JsonStderrEmitter::default())),
+        }
+    }
+
+    pub fn emit<T: Serialize>(&self, name: &str, payload: T) {
+        let Some(emitter) = &self.emitter else {
+            return;
+        };
+        match serde_json::to_value(payload) {
+            Ok(value) => emitter.emit(name, value),
+            Err(err) => {
+                let mut stderr = io::stderr();
+                let _ = writeln!(stderr, "failed to encode event {name}: {err}");
+            }
+        }
+    }
+}
+
+impl fmt::Debug for EventSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EventSink")
+            .field("enabled", &self.emitter.is_some())
+            .finish()
+    }
+}
+
+trait EventEmitter: Send + Sync {
+    fn emit(&self, name: &str, payload: Value);
+}
+
+#[derive(Default)]
+struct JsonStderrEmitter {
+    lock: Mutex<()>,
+}
+
+impl EventEmitter for JsonStderrEmitter {
+    fn emit(&self, name: &str, payload: Value) {
+        let _guard = self.lock.lock().unwrap();
+        let event = json!({ "event": name, "payload": payload });
+        if let Ok(line) = serde_json::to_string(&event) {
+            let mut stderr = io::stderr();
+            let _ = writeln!(stderr, "{}", line);
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum ModelProvider {
@@ -119,6 +181,7 @@ pub struct CommitQuery {
 pub struct FetchOpts {
     pub verbose: bool,
     pub base_url: Option<Url>,
+    pub event_sink: EventSink,
 }
 
 #[derive(Clone)]
@@ -127,6 +190,7 @@ struct GitHubClient {
     base_url: Url,
     token: Option<String>,
     verbose: bool,
+    event_sink: EventSink,
 }
 
 pub fn build_commit_query(args: &CommitQueryInput) -> Result<CommitQuery> {
@@ -161,9 +225,14 @@ pub fn build_commit_query(args: &CommitQueryInput) -> Result<CommitQuery> {
 
 pub async fn fetch_commits(query: &CommitQuery, opts: &FetchOpts) -> Result<Vec<CommitRecord>> {
     let client = if let Some(base_url) = opts.base_url.clone() {
-        GitHubClient::with_base_url(base_url, query.token.clone(), opts.verbose)?
+        GitHubClient::with_base_url(
+            base_url,
+            query.token.clone(),
+            opts.verbose,
+            opts.event_sink.clone(),
+        )?
     } else {
-        GitHubClient::new(query.token.clone(), opts.verbose)?
+        GitHubClient::new(query.token.clone(), opts.verbose, opts.event_sink.clone())?
     };
     let repos = client
         .list_repos(&query.user, query.repo_filter.as_ref())
@@ -297,6 +366,12 @@ async fn collect_commits(
         let client = client.clone();
         let author = author.to_string();
         async move {
+            client.emit(
+                "repo_scan_start",
+                json!({
+                    "repo": repo.full_name.clone(),
+                }),
+            );
             let commits = client
                 .fetch_commits_for_repo(&repo, &author, since, until)
                 .await
@@ -308,6 +383,13 @@ async fn collect_commits(
 
     while let Some(result) = stream.next().await {
         let (repo, commits) = result?;
+        client.emit(
+            "repo_scan_finish",
+            json!({
+                "repo": repo.full_name.clone(),
+                "commit_count": commits.len(),
+            }),
+        );
         for commit in commits {
             let key = (repo.full_name.clone(), commit.sha.clone());
             if seen.insert(key) {
@@ -317,6 +399,12 @@ async fn collect_commits(
     }
 
     aggregated.sort_by_key(|c| c.timestamp);
+    client.emit(
+        "dedup_complete",
+        json!({
+            "unique_commits": aggregated.len(),
+        }),
+    );
     Ok(aggregated)
 }
 
@@ -348,12 +436,21 @@ impl RepoFilter {
 }
 
 impl GitHubClient {
-    fn new(token: Option<String>, verbose: bool) -> Result<Self> {
-        let base_url = Url::parse("https://api.github.com/")?;
-        Self::with_base_url(base_url, token, verbose)
+    fn emit<T: Serialize>(&self, name: &str, payload: T) {
+        self.event_sink.emit(name, payload);
     }
 
-    fn with_base_url(base_url: Url, token: Option<String>, verbose: bool) -> Result<Self> {
+    fn new(token: Option<String>, verbose: bool, event_sink: EventSink) -> Result<Self> {
+        let base_url = Url::parse("https://api.github.com/")?;
+        Self::with_base_url(base_url, token, verbose, event_sink)
+    }
+
+    fn with_base_url(
+        base_url: Url,
+        token: Option<String>,
+        verbose: bool,
+        event_sink: EventSink,
+    ) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(
             ACCEPT,
@@ -379,27 +476,45 @@ impl GitHubClient {
             base_url,
             token,
             verbose,
+            event_sink,
         })
     }
 
     async fn list_repos(&self, login: &str, repo_filter: Option<&RepoFilter>) -> Result<Vec<Repo>> {
-        if let Some(filter) = repo_filter {
+        let repos = if let Some(filter) = repo_filter {
             let repo = self.fetch_single_repo(&filter.owner, &filter.name).await?;
-            return Ok(vec![repo]);
-        }
+            vec![repo]
+        } else if self.token.is_none() {
+            self.list_public_repos(login).await?
+        } else {
+            let authenticated_login = self.authenticated_login().await?;
+            if let Some(auth_login) = authenticated_login {
+                if auth_login.eq_ignore_ascii_case(login) {
+                    self.list_authenticated_repos().await?
+                } else {
+                    self.list_public_repos(login).await?
+                }
+            } else {
+                self.list_public_repos(login).await?
+            }
+        };
 
-        if self.token.is_none() {
-            return self.list_public_repos(login).await;
-        }
-
-        let authenticated_login = self.authenticated_login().await?;
-        if let Some(auth_login) = authenticated_login {
-            if auth_login.eq_ignore_ascii_case(login) {
-                return self.list_authenticated_repos().await;
+        let mut seen = HashSet::new();
+        let mut unique = Vec::new();
+        for repo in repos {
+            if seen.insert(repo.full_name.clone()) {
+                unique.push(repo);
             }
         }
+        self.emit(
+            "discovered_repos",
+            json!({
+                "count": unique.len(),
+                "repos": unique.iter().map(|r| r.full_name.clone()).collect::<Vec<_>>(),
+            }),
+        );
 
-        self.list_public_repos(login).await
+        Ok(unique)
     }
 
     async fn authenticated_login(&self) -> Result<Option<String>> {
@@ -499,6 +614,14 @@ impl GitHubClient {
             let mut repos: Vec<Repo> =
                 serde_json::from_str(&body).context("failed to parse repos response")?;
             let page_len = repos.len();
+            self.emit(
+                "repos_page",
+                json!({
+                    "page": page,
+                    "repos_found": page_len,
+                    "has_next": has_next,
+                }),
+            );
             all.append(&mut repos);
             if !has_next || page_len == 0 {
                 break;
@@ -560,6 +683,15 @@ impl GitHubClient {
             let commits: Vec<GitHubCommit> =
                 serde_json::from_str(&body).context("failed to parse commits response")?;
             let page_len = commits.len();
+            self.emit(
+                "repo_commits_page",
+                json!({
+                    "repo": repo.full_name.clone(),
+                    "page": page,
+                    "items": page_len,
+                    "has_next": has_next,
+                }),
+            );
             for commit in commits {
                 let timestamp = commit
                     .commit
@@ -625,12 +757,30 @@ impl GitHubClient {
                 eprintln!("GET {} (commit search page {})", url, page);
             }
 
-            let resp = self.client.get(url).send().await?;
+            let resp = self.client.get(url).send().await.map_err(|err| {
+                self.emit(
+                    "falling_back_to_per_repo",
+                    json!({
+                        "reason": "search_request_failed",
+                        "page": page,
+                        "error": err.to_string(),
+                    }),
+                );
+                err
+            })?;
             let status = resp.status();
             let headers = resp.headers().clone();
             let has_next = has_next_link(&headers);
             let body = resp.text().await.unwrap_or_default();
             if !status.is_success() {
+                self.emit(
+                    "falling_back_to_per_repo",
+                    json!({
+                        "reason": "search_http_error",
+                        "status": status.as_u16(),
+                        "page": page,
+                    }),
+                );
                 bail!(format_error(
                     status,
                     &headers,
@@ -639,16 +789,43 @@ impl GitHubClient {
                 ));
             }
 
-            let payload: SearchCommitsResponse =
-                serde_json::from_str(&body).context("failed to parse commit search response")?;
+            let payload: SearchCommitsResponse = serde_json::from_str(&body).map_err(|err| {
+                self.emit(
+                    "falling_back_to_per_repo",
+                    json!({
+                        "reason": "search_decode_failed",
+                        "page": page,
+                        "error": err.to_string(),
+                    }),
+                );
+                anyhow!("failed to parse commit search response: {}", err)
+            })?;
+            let page_len = payload.items.len();
+            self.emit(
+                "search_page",
+                json!({
+                    "page": page,
+                    "items": page_len,
+                    "total_count": payload.total_count,
+                    "incomplete_results": payload.incomplete_results,
+                }),
+            );
             if payload.total_count > 1000 || payload.incomplete_results {
+                self.emit(
+                    "falling_back_to_per_repo",
+                    json!({
+                        "reason": "search_incomplete",
+                        "page": page,
+                        "total_count": payload.total_count,
+                        "incomplete_results": payload.incomplete_results,
+                    }),
+                );
                 bail!(format!(
                     "commit search incomplete (total_count={}, incomplete_results={})",
                     payload.total_count, payload.incomplete_results
                 ));
             }
 
-            let page_len = payload.items.len();
             for item in payload.items {
                 let timestamp = item
                     .commit
@@ -679,6 +856,12 @@ impl GitHubClient {
         }
 
         all.sort_by_key(|c| c.timestamp);
+        self.emit(
+            "dedup_complete",
+            json!({
+                "unique_commits": all.len(),
+            }),
+        );
         Ok(all)
     }
 }
@@ -741,7 +924,7 @@ mod tests {
 
     fn client_for(server: &MockServer) -> GitHubClient {
         let base = Url::parse(&format!("{}/", server.base_url())).unwrap();
-        GitHubClient::with_base_url(base, None, false).unwrap()
+        GitHubClient::with_base_url(base, None, false, EventSink::null()).unwrap()
     }
 
     #[tokio::test]

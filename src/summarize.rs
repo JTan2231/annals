@@ -1,8 +1,9 @@
-use crate::CommitRecord;
+use crate::{CommitRecord, EventSink};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::ValueEnum;
 use serde::Serialize;
+use serde_json::json;
 use std::env;
 use wire::api::{API, Prompt};
 use wire::config::ClientOptions;
@@ -26,6 +27,7 @@ pub struct SummarizeOpts {
     pub max_chars: usize,
     pub verbose: bool,
     pub base_url: Option<String>,
+    pub event_sink: EventSink,
 }
 
 impl Default for SummarizeOpts {
@@ -36,6 +38,7 @@ impl Default for SummarizeOpts {
             max_chars: DEFAULT_MAX_CHARS,
             verbose: false,
             base_url: None,
+            event_sink: EventSink::null(),
         }
     }
 }
@@ -58,6 +61,7 @@ pub async fn summarize_commits(
     commits: &[CommitRecord],
     opts: SummarizeOpts,
 ) -> Result<SummaryOutcome> {
+    let events = opts.event_sink.clone();
     let total_commits = commits.len();
     let mut filtered: Vec<CommitRecord> = commits
         .iter()
@@ -65,6 +69,13 @@ pub async fn summarize_commits(
         .cloned()
         .collect();
     let filtered_out = total_commits.saturating_sub(filtered.len());
+    events.emit(
+        "filtered_commits",
+        json!({
+            "filtered_out": filtered_out,
+            "remaining": filtered.len(),
+        }),
+    );
 
     if filtered.is_empty() {
         bail!("No commits to summarize after filtering VIZIER CONVERSATION entries");
@@ -75,6 +86,13 @@ pub async fn summarize_commits(
     let formatted: Vec<String> = filtered.iter().map(format_commit_line).collect();
 
     let text_budget = effective_budget(opts.max_chars)?;
+    events.emit(
+        "effective_budget",
+        json!({
+            "max_chars": opts.max_chars,
+            "effective_budget": text_budget,
+        }),
+    );
     let chunks = chunk_lines(&formatted, text_budget);
     let chunk_count = chunks.len();
     let context_char_count = chunks.iter().map(|c| c.len()).max().unwrap_or(0);
@@ -84,13 +102,23 @@ pub async fn summarize_commits(
         filtered.first().unwrap().timestamp,
         filtered.last().unwrap().timestamp,
     );
+    if truncated {
+        events.emit(
+            "chunk_compaction",
+            json!({
+                "chunk_count": chunk_count,
+                "largest_chunk_chars": context_char_count,
+                "truncated": truncated,
+            }),
+        );
+    }
 
     let api = resolve_api(&opts)?;
     validate_api_key(&api)?;
     let client = build_client(&api, &opts)?;
+    let (provider, model) = api.to_strings();
 
     if opts.verbose {
-        let (provider, model) = api.to_strings();
         eprintln!(
             "Summarizing {} commits ({} filtered) via {}:{} across {} chunk(s); largest chunk {} chars",
             filtered.len(),
@@ -104,12 +132,33 @@ pub async fn summarize_commits(
 
     let mut partials = Vec::new();
     for (idx, chunk) in chunks.iter().enumerate() {
-        partials.push(summarize_chunk(client.as_ref(), &api, chunk, idx + 1, chunk_count).await?);
+        partials.push(
+            summarize_chunk(
+                client.as_ref(),
+                &api,
+                chunk,
+                idx + 1,
+                chunk_count,
+                &events,
+                &provider,
+                &model,
+            )
+            .await?,
+        );
     }
-    let summary = finalize_summary(client.as_ref(), &api, &partials.join("\n"), &timespan).await?;
+    let summary = finalize_summary(
+        client.as_ref(),
+        &api,
+        &partials.join("\n"),
+        partials.len(),
+        &timespan,
+        &events,
+        &provider,
+        &model,
+    )
+    .await?;
 
-    let (provider, model) = api.to_strings();
-    Ok(SummaryOutcome {
+    let outcome = SummaryOutcome {
         summary,
         provider,
         model,
@@ -120,7 +169,22 @@ pub async fn summarize_commits(
         chunk_count,
         truncated,
         truncated_lines,
-    })
+    };
+    events.emit(
+        "summary_ready",
+        json!({
+            "provider": outcome.provider,
+            "model": outcome.model,
+            "total_commits": outcome.total_commits,
+            "filtered_out": outcome.filtered_out,
+            "included_commits": outcome.included_commits,
+            "context_char_count": outcome.context_char_count,
+            "chunk_count": outcome.chunk_count,
+            "truncated": outcome.truncated,
+            "truncated_lines": outcome.truncated_lines,
+        }),
+    );
+    Ok(outcome)
 }
 
 fn resolve_api(opts: &SummarizeOpts) -> Result<API> {
@@ -174,17 +238,71 @@ async fn summarize_chunk(
     chunk: &str,
     idx: usize,
     total: usize,
+    events: &EventSink,
+    provider: &str,
+    model: &str,
 ) -> Result<String> {
+    events.emit(
+        "chunk_summary_start",
+        json!({
+            "index": idx,
+            "total": total,
+            "provider": provider,
+            "model": model,
+            "input_chars": chunk.len(),
+        }),
+    );
     let (system_prompt, content) = summarize_prompt(chunk, idx, total);
-    prompt_model(client, api, &system_prompt, &content).await
+    let result = prompt_model(client, api, &system_prompt, &content).await;
+    match result {
+        Ok(text) => {
+            events.emit(
+                "chunk_summary_finish",
+                json!({
+                    "index": idx,
+                    "total": total,
+                    "provider": provider,
+                    "model": model,
+                    "input_chars": chunk.len(),
+                }),
+            );
+            Ok(text)
+        }
+        Err(err) => {
+            events.emit(
+                "chunk_summary_finish",
+                json!({
+                    "index": idx,
+                    "total": total,
+                    "provider": provider,
+                    "model": model,
+                    "input_chars": chunk.len(),
+                    "error": err.to_string(),
+                }),
+            );
+            Err(err)
+        }
+    }
 }
 
 async fn finalize_summary(
     client: &dyn Prompt,
     api: &API,
     partials: &str,
+    partial_count: usize,
     timespan: &str,
+    events: &EventSink,
+    provider: &str,
+    model: &str,
 ) -> Result<String> {
+    events.emit(
+        "summary_merge",
+        json!({
+            "partials": partial_count,
+            "provider": provider,
+            "model": model,
+        }),
+    );
     let (system_prompt, content) = final_prompt(partials, timespan);
     prompt_model(client, api, &system_prompt, &content).await
 }
@@ -488,6 +606,7 @@ mod tests {
                 max_chars: 1_100,
                 verbose: false,
                 base_url: Some(base_url),
+                event_sink: EventSink::null(),
             },
         )
         .await

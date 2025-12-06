@@ -1,10 +1,11 @@
 use annals::{
-    build_commit_query, fetch_commits, load_commits_from_file, pretty_format_summary,
-    summarize_commits, CommitQueryInput, CommitRecord, FetchOpts, ModelProvider, SummarizeOpts,
-    SummaryOutputFormat,
+    CommitQueryInput, CommitRecord, EventSink, FetchOpts, ModelProvider, SummarizeOpts,
+    SummaryOutputFormat, build_commit_query, fetch_commits, load_commits_from_file,
+    pretty_format_summary, summarize_commits,
 };
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -71,6 +72,10 @@ struct FetchCommitsArgs {
     /// Emit pagination and request progress
     #[arg(long)]
     verbose: bool,
+
+    /// Stream JSON events describing progress to stderr
+    #[arg(long)]
+    events_json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -88,6 +93,10 @@ struct SummarizeArgs {
     /// Emit pagination and request progress
     #[arg(long)]
     verbose: bool,
+
+    /// Stream JSON events describing progress to stderr
+    #[arg(long)]
+    events_json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -134,20 +143,39 @@ async fn main() -> Result<()> {
 }
 
 async fn run_fetch_commits(args: FetchCommitsArgs) -> Result<()> {
+    let event_sink = if args.events_json {
+        EventSink::json_stderr()
+    } else {
+        EventSink::null()
+    };
     let query = build_commit_query(&args.query.into_input())?;
+    event_sink.emit(
+        "normalized_query",
+        json!({
+            "since": query.since.to_rfc3339(),
+            "until": query.until.to_rfc3339(),
+            "repo_filter": query.repo_filter.as_ref().map(|r| json!({"owner": r.owner, "name": r.name})).unwrap_or(Value::Null),
+            "token_present": query.token.is_some(),
+            "user": query.user.clone(),
+        }),
+    );
     let commits = fetch_commits(
         &query,
         &FetchOpts {
             verbose: args.verbose,
             base_url: None,
+            event_sink: event_sink.clone(),
         },
     )
     .await?;
 
     if commits.is_empty() {
+        event_sink.emit("no_commits", json!({"count": 0}));
         println!("No commits found for the specified window.");
         return Ok(());
     }
+
+    event_sink.emit("emit_commits_complete", json!({ "count": commits.len() }));
 
     match args.format {
         OutputFormat::Human => print_human(&commits),
@@ -158,21 +186,46 @@ async fn run_fetch_commits(args: FetchCommitsArgs) -> Result<()> {
 }
 
 async fn run_summarize(args: SummarizeArgs) -> Result<()> {
+    let event_sink = if args.events_json {
+        EventSink::json_stderr()
+    } else {
+        EventSink::null()
+    };
     let commits = if let Some(ref input) = args.input {
-        load_commits_from_file(input)?
+        let loaded = load_commits_from_file(input)?;
+        event_sink.emit(
+            "summary_input",
+            json!({
+                "source": "file",
+                "path": input.display().to_string(),
+                "commit_count": loaded.len(),
+            }),
+        );
+        loaded
     } else {
         let query = build_commit_query(&args.query.clone().into_input())?;
-        fetch_commits(
+        let fetched = fetch_commits(
             &query,
             &FetchOpts {
                 verbose: args.verbose,
                 base_url: None,
+                event_sink: event_sink.clone(),
             },
         )
-        .await?
+        .await?;
+        event_sink.emit(
+            "summary_input",
+            json!({
+                "source": "github",
+                "user": query.user,
+                "commit_count": fetched.len(),
+            }),
+        );
+        fetched
     };
 
     if commits.is_empty() {
+        event_sink.emit("no_commits", json!({"count": 0}));
         println!("No commits found for the specified window.");
         return Ok(());
     }
@@ -185,6 +238,7 @@ async fn run_summarize(args: SummarizeArgs) -> Result<()> {
             max_chars: args.summarize.max_chars,
             verbose: args.verbose,
             base_url: args.summarize.base_url.clone(),
+            event_sink: event_sink.clone(),
         },
     )
     .await?;

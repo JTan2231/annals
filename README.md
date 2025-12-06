@@ -9,6 +9,7 @@
 *   **LLM Summarization**: transform raw commit logs into a narrative story of accomplishments using OpenAI, Anthropic, or Gemini.
 *   **Smart Chunking**: Automatically splits large commit histories into chunks to fit within LLM context windows.
 *   **JSON & Human Output**: Export raw data for processing or view pretty-printed summaries directly in the terminal.
+*   **Streaming Events**: Optional JSON event stream on stderr for progress-aware scripts and dashboards.
 *   **Library API**: Consume the same fetch and summarize flows directly from Rust without shelling out.
 
 ## Installation
@@ -64,13 +65,25 @@ annals summarize --input commits.json
 annals summarize --input commits.json --pretty
 ```
 
+### Streaming JSON events
+
+Both commands can stream machine-readable events to stderr without affecting stdout payloads:
+
+```bash
+annals fetch-commits --user jdoe --since "7 days" --events-json 2> events.log
+annals summarize --input commits.json --events-json
+```
+
+Events are JSON objects with `event` and `payload` fields (e.g., repo discovery, search fallbacks, chunk summary start/finish, final summary stats).
+
 ## Embedding as a Library
 
 `annals` exposes the same fetch/summarize pipeline as a crate so other tools can drive it programmatically.
 
 ```rust
 use annals::{
-    build_commit_query, fetch_commits, summarize_commits, CommitQueryInput, FetchOpts, SummarizeOpts,
+    build_commit_query, fetch_commits, summarize_commits, CommitQueryInput, EventSink, FetchOpts,
+    SummarizeOpts,
 };
 
 #[tokio::main]
@@ -83,8 +96,22 @@ async fn main() -> anyhow::Result<()> {
         repo: None,
     })?;
 
-    let commits = fetch_commits(&query, &FetchOpts::default()).await?;
-    let summary = summarize_commits(&commits, SummarizeOpts::default()).await?;
+    let commits = fetch_commits(
+        &query,
+        &FetchOpts {
+            event_sink: EventSink::json_stderr(),
+            ..FetchOpts::default()
+        },
+    )
+    .await?;
+    let summary = summarize_commits(
+        &commits,
+        SummarizeOpts {
+            event_sink: EventSink::json_stderr(),
+            ..SummarizeOpts::default()
+        },
+    )
+    .await?;
     println!("{}", summary.summary);
     Ok(())
 }
