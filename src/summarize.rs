@@ -250,12 +250,14 @@ async fn summarize_chunk(
             "provider": provider,
             "model": model,
             "input_chars": chunk.len(),
+            "chunk": chunk,
         }),
     );
     let (system_prompt, content) = summarize_prompt(chunk, idx, total);
     let result = prompt_model(client, api, &system_prompt, &content).await;
     match result {
         Ok(text) => {
+            let output = text.clone();
             events.emit(
                 "chunk_summary_finish",
                 json!({
@@ -264,6 +266,8 @@ async fn summarize_chunk(
                     "provider": provider,
                     "model": model,
                     "input_chars": chunk.len(),
+                    "chunk": chunk,
+                    "output": output,
                 }),
             );
             Ok(text)
@@ -273,15 +277,16 @@ async fn summarize_chunk(
                 "chunk_summary_finish",
                 json!({
                     "index": idx,
-                    "total": total,
-                    "provider": provider,
-                    "model": model,
-                    "input_chars": chunk.len(),
-                    "error": err.to_string(),
-                }),
-            );
-            Err(err)
-        }
+                "total": total,
+                "provider": provider,
+                "model": model,
+                "input_chars": chunk.len(),
+                "chunk": chunk,
+                "error": err.to_string(),
+            }),
+        );
+        Err(err)
+    }
     }
 }
 
@@ -304,7 +309,19 @@ async fn finalize_summary(
         }),
     );
     let (system_prompt, content) = final_prompt(partials, timespan);
-    prompt_model(client, api, &system_prompt, &content).await
+    let summary = prompt_model(client, api, &system_prompt, &content).await?;
+    let output = summary.clone();
+    events.emit(
+        "summary_merge_result",
+        json!({
+            "partials": partial_count,
+            "provider": provider,
+            "model": model,
+            "timespan": timespan,
+            "output": output,
+        }),
+    );
+    Ok(summary)
 }
 
 async fn prompt_model(
