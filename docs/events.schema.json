@@ -1,0 +1,510 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Annals JSON Event Stream",
+  "description": "Schemas for every JSON event emitted when --events-json is enabled.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/NormalizedQueryEvent" },
+    { "$ref": "#/$defs/SummaryInputEvent" },
+    { "$ref": "#/$defs/DiscoveredReposEvent" },
+    { "$ref": "#/$defs/ReposPageEvent" },
+    { "$ref": "#/$defs/RepoScanStartEvent" },
+    { "$ref": "#/$defs/RepoScanFinishEvent" },
+    { "$ref": "#/$defs/RepoCommitsPageEvent" },
+    { "$ref": "#/$defs/SearchPageEvent" },
+    { "$ref": "#/$defs/FallingBackToPerRepoEvent" },
+    { "$ref": "#/$defs/DedupCompleteEvent" },
+    { "$ref": "#/$defs/NoCommitsEvent" },
+    { "$ref": "#/$defs/EmitCommitsCompleteEvent" },
+    { "$ref": "#/$defs/FilteredCommitsEvent" },
+    { "$ref": "#/$defs/EffectiveBudgetEvent" },
+    { "$ref": "#/$defs/ChunkCompactionEvent" },
+    { "$ref": "#/$defs/ChunkSummaryStartEvent" },
+    { "$ref": "#/$defs/ChunkSummaryFinishEvent" },
+    { "$ref": "#/$defs/SummaryMergeEvent" },
+    { "$ref": "#/$defs/SummaryMergeResultEvent" },
+    { "$ref": "#/$defs/SummaryReadyEvent" }
+  ],
+  "$defs": {
+    "Commit": {
+      "type": "object",
+      "properties": {
+        "repo": { "type": "string" },
+        "sha": { "type": "string" },
+        "message": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "url": { "type": "string", "format": "uri" },
+        "author": { "type": ["string", "null"] },
+        "committer": { "type": ["string", "null"] }
+      },
+      "required": ["repo", "sha", "message", "timestamp", "url"],
+      "additionalProperties": false
+    },
+    "RepoFilter": {
+      "type": "object",
+      "properties": {
+        "owner": { "type": "string" },
+        "name": { "type": "string" }
+      },
+      "required": ["owner", "name"],
+      "additionalProperties": false
+    },
+    "NormalizedQueryEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "normalized_query" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "since": { "type": "string", "format": "date-time" },
+            "until": { "type": "string", "format": "date-time" },
+            "repo_filter": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/$defs/RepoFilter" }
+              ]
+            },
+            "token_present": { "type": "boolean" },
+            "user": { "type": "string" }
+          },
+          "required": ["since", "until", "repo_filter", "token_present", "user"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "SummaryInputEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "summary_input" },
+        "payload": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "source": { "const": "file" },
+                "path": { "type": "string" },
+                "commit_count": { "type": "integer", "minimum": 0 }
+              },
+              "required": ["source", "path", "commit_count"],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "source": { "const": "github" },
+                "user": { "type": "string" },
+                "commit_count": { "type": "integer", "minimum": 0 }
+              },
+              "required": ["source", "user", "commit_count"],
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "DiscoveredReposEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "discovered_repos" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "repos": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "required": ["count", "repos"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "ReposPageEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "repos_page" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "page": { "type": "integer", "minimum": 1 },
+            "repos_found": { "type": "integer", "minimum": 0 },
+            "has_next": { "type": "boolean" }
+          },
+          "required": ["page", "repos_found", "has_next"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "RepoScanStartEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "repo_scan_start" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "repo": { "type": "string" }
+          },
+          "required": ["repo"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "RepoScanFinishEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "repo_scan_finish" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "repo": { "type": "string" },
+            "commit_count": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["repo", "commit_count"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "RepoCommitsPageEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "repo_commits_page" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "repo": { "type": "string" },
+            "page": { "type": "integer", "minimum": 1 },
+            "items": { "type": "integer", "minimum": 0 },
+            "has_next": { "type": "boolean" }
+          },
+          "required": ["repo", "page", "items", "has_next"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "SearchPageEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "search_page" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "page": { "type": "integer", "minimum": 1 },
+            "items": { "type": "integer", "minimum": 0 },
+            "total_count": { "type": "integer", "minimum": 0 },
+            "incomplete_results": { "type": "boolean" }
+          },
+          "required": ["page", "items", "total_count", "incomplete_results"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "FallingBackToPerRepoEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "falling_back_to_per_repo" },
+        "payload": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "reason": { "const": "search_request_failed" },
+                "page": { "type": "integer", "minimum": 1 },
+                "error": { "type": "string" }
+              },
+              "required": ["reason", "page", "error"],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "reason": { "const": "search_http_error" },
+                "status": { "type": "integer", "minimum": 100 },
+                "page": { "type": "integer", "minimum": 1 }
+              },
+              "required": ["reason", "status", "page"],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "reason": { "const": "search_decode_failed" },
+                "page": { "type": "integer", "minimum": 1 },
+                "error": { "type": "string" }
+              },
+              "required": ["reason", "page", "error"],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "reason": { "const": "search_incomplete" },
+                "page": { "type": "integer", "minimum": 1 },
+                "total_count": { "type": "integer", "minimum": 0 },
+                "incomplete_results": { "type": "boolean" }
+              },
+              "required": ["reason", "page", "total_count", "incomplete_results"],
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "DedupCompleteEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "dedup_complete" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "unique_commits": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["unique_commits"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "NoCommitsEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "no_commits" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "count": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["count"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "EmitCommitsCompleteEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "emit_commits_complete" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "count": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["count"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "FilteredCommitsEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "filtered_commits" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "filtered_out": { "type": "integer", "minimum": 0 },
+            "remaining": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["filtered_out", "remaining"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "EffectiveBudgetEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "effective_budget" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "max_chars": { "type": "integer", "minimum": 0 },
+            "effective_budget": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["max_chars", "effective_budget"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "ChunkCompactionEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "chunk_compaction" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "chunk_count": { "type": "integer", "minimum": 1 },
+            "largest_chunk_chars": { "type": "integer", "minimum": 0 },
+            "truncated": { "type": "boolean" }
+          },
+          "required": ["chunk_count", "largest_chunk_chars", "truncated"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "ChunkSummaryStartEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "chunk_summary_start" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "index": { "type": "integer", "minimum": 1 },
+            "total": { "type": "integer", "minimum": 1 },
+            "provider": { "type": "string" },
+            "model": { "type": "string" },
+            "input_chars": { "type": "integer", "minimum": 0 },
+            "chunk": { "type": "string" }
+          },
+          "required": ["index", "total", "provider", "model", "input_chars", "chunk"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "ChunkSummaryFinishEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "chunk_summary_finish" },
+        "payload": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "index": { "type": "integer", "minimum": 1 },
+                "total": { "type": "integer", "minimum": 1 },
+                "provider": { "type": "string" },
+                "model": { "type": "string" },
+                "input_chars": { "type": "integer", "minimum": 0 },
+                "chunk": { "type": "string" },
+                "output": { "type": "string" }
+              },
+              "required": ["index", "total", "provider", "model", "input_chars", "chunk", "output"],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "index": { "type": "integer", "minimum": 1 },
+                "total": { "type": "integer", "minimum": 1 },
+                "provider": { "type": "string" },
+                "model": { "type": "string" },
+                "input_chars": { "type": "integer", "minimum": 0 },
+                "chunk": { "type": "string" },
+                "error": { "type": "string" }
+              },
+              "required": ["index", "total", "provider", "model", "input_chars", "chunk", "error"],
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "SummaryMergeEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "summary_merge" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "partials": { "type": "integer", "minimum": 0 },
+            "provider": { "type": "string" },
+            "model": { "type": "string" }
+          },
+          "required": ["partials", "provider", "model"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "SummaryMergeResultEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "summary_merge_result" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "partials": { "type": "integer", "minimum": 0 },
+            "provider": { "type": "string" },
+            "model": { "type": "string" },
+            "timespan": { "type": "string" },
+            "output": { "type": "string" }
+          },
+          "required": ["partials", "provider", "model", "timespan", "output"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    },
+    "SummaryReadyEvent": {
+      "type": "object",
+      "properties": {
+        "event": { "const": "summary_ready" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "provider": { "type": "string" },
+            "model": { "type": "string" },
+            "total_commits": { "type": "integer", "minimum": 0 },
+            "filtered_out": { "type": "integer", "minimum": 0 },
+            "included_commits": { "type": "integer", "minimum": 0 },
+            "context_char_count": { "type": "integer", "minimum": 0 },
+            "chunk_count": { "type": "integer", "minimum": 0 },
+            "truncated": { "type": "boolean" },
+            "truncated_lines": { "type": "integer", "minimum": 0 },
+            "commits": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/Commit" }
+            }
+          },
+          "required": [
+            "provider",
+            "model",
+            "total_commits",
+            "filtered_out",
+            "included_commits",
+            "context_char_count",
+            "chunk_count",
+            "truncated",
+            "truncated_lines",
+            "commits"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": ["event", "payload"],
+      "additionalProperties": false
+    }
+  }
+}

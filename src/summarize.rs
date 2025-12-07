@@ -182,6 +182,7 @@ pub async fn summarize_commits(
             "chunk_count": outcome.chunk_count,
             "truncated": outcome.truncated,
             "truncated_lines": outcome.truncated_lines,
+            "commits": filtered,
         }),
     );
     Ok(outcome)
